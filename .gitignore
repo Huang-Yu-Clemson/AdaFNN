@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+data/
+data_R/
+results/
+logs/
+
+firm_R_output/
+firm_R_torch_output/
+firm_python_output/
+firm_shared/
+train_firm/
+
+desktop.ini
