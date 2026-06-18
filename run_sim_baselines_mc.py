@@ -10,13 +10,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import Adam
 
 from simulation_common import (
     DataGenerator,
     FeedForward,
-    SplitData,
+    DataLoader,
     baseline_label,
     load_feedforward_model,
     make_baseline_features,
@@ -80,13 +81,13 @@ def train_one(args: argparse.Namespace) -> dict:
         fve=args.fve,
     )
 
-    data = SplitData(
-        features,
-        y,
-        t,
-        batch_size=args.batch_size,
+    data = DataLoader(
+        args.batch_size,
+        pd.DataFrame(features),
+        pd.DataFrame(y),
+        pd.DataFrame(np.asarray(t).reshape(1, -1)),
         split=tuple(args.split),
-        seed=args.split_seed,
+        random_seed=args.split_seed,
     )
 
     hidden = parse_int_list(args.hidden)
@@ -221,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fve", type=float, default=0.9)
 
     parser.add_argument("--hidden", default="128,128,128")
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)

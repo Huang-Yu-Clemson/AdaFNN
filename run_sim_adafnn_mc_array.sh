@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sim_ada_mc
 #SBATCH --time=04:00:00
-#SBATCH --array=0-499%50
+#SBATCH --array=0-499%100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -132,9 +132,7 @@ python run_sim_adafnn_mc.py \
   --n-base "${n_base}" \
   --base-hidden 128,128,128 \
   --sub-hidden 128,128,128 \
-  --dropout 0.0 \
-  --orth-pairs 3 \
-  --sparse-bases 2 \
+  --dropout 0.1 \
   --epochs 500 \
   --batch-size 128 \
   --lr 0.0003

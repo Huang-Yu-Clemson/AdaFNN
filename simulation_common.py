@@ -17,144 +17,150 @@ from sklearn.preprocessing import StandardScaler
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-6):
+
+    def __init__(self, d, eps=1e-6):
         super().__init__()
+        # d is the normalization dimension
         self.d = d
         self.eps = eps
         self.alpha = nn.Parameter(torch.randn(d))
         self.beta = nn.Parameter(torch.randn(d))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
+        # x is a torch.Tensor
+        # avg is the mean value of a layer
         avg = x.mean(dim=-1, keepdim=True)
+        # std is the standard deviation of a layer (eps is added to prevent dividing by zero)
         std = x.std(dim=-1, keepdim=True) + self.eps
         return (x - avg) / std * self.alpha + self.beta
 
 
 class FeedForward(nn.Module):
-    def __init__(
-        self,
-        in_d: int = 1,
-        hidden: list[int] = [128, 128, 128],
-        dropout: float = 0.0,
-        activation=F.relu,
-    ):
+
+    def __init__(self, in_d=1, hidden=[4,4,4], dropout=0.1, activation=F.relu):
+        # in_d      : input dimension, integer
+        # hidden    : hidden layer dimension, array of integers
+        # dropout   : dropout probability, a float between 0.0 and 1.0
+        # activation: activation function at each layer
         super().__init__()
         self.sigma = activation
         dim = [in_d] + hidden + [1]
-        self.layers = nn.ModuleList(
-            [nn.Linear(dim[i - 1], dim[i]) for i in range(1, len(dim))]
-        )
+        self.layers = nn.ModuleList([nn.Linear(dim[i-1], dim[i]) for i in range(1, len(dim))])
         self.ln = nn.ModuleList([LayerNorm(k) for k in hidden])
         self.dp = nn.ModuleList([nn.Dropout(dropout) for _ in range(len(hidden))])
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        for i in range(len(self.layers) - 1):
+    def forward(self, t):
+        for i in range(len(self.layers)-1):
             t = self.layers[i](t)
+            # skipping connection
             t = t + self.ln[i](t)
             t = self.sigma(t)
+            # apply dropout
             t = self.dp[i](t)
+        # linear activation at the last layer
         return self.layers[-1](t)
 
 
-def inner_product(f1: torch.Tensor, f2: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    prod = f1 * f2
-    return torch.matmul((prod[:, :-1] + prod[:, 1:]), h.unsqueeze(dim=-1)) / 2
+def _inner_product(f1, f2, h):
+    """    
+    f1 - (B, J) : B functions, observed at J time points,
+    f2 - (B, J) : same as f1
+    h  - (J-1,1): weights used in the trapezoidal rule
+    pay attention to dimension
+    <f1, f2> = sum (h/2) (f1(t{j}) + f2(t{j+1}))
+    """
+    prod = f1 * f2 # (B, J = len(h) + 1)
+    return torch.matmul((prod[:, :-1] + prod[:, 1:]), h.unsqueeze(dim=-1))/2
 
 
-def l1_norm(f: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    b, j = f.size()
-    return inner_product(torch.abs(f), torch.ones((b, j), device=f.device), h)
+def _l1(f, h):
+    # f dimension : ( B bases, J )
+    B, J = f.size()
+    return _inner_product(torch.abs(f), torch.ones((B, J)), h)
 
 
-def l2_norm(f: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    return torch.sqrt(inner_product(f, f, h))
+def _l2(f, h):
+    # f dimension : ( B bases, J )
+    # output dimension - ( B bases, 1 )
+    return torch.sqrt(_inner_product(f, f, h)) 
 
 
 class AdaFNN(nn.Module):
-    def __init__(
-        self,
-        n_base: int = 4,
-        base_hidden: list[int] = [128, 128, 128],
-        grid: np.ndarray | list[float] = (0.0, 1.0),
-        sub_hidden: list[int] = [128, 128, 128],
-        dropout: float = 0.0,
-        lambda1: float = 0.0,
-        lambda2: float = 0.0,
-        device: torch.device | None = None,
-    ):
+
+    def __init__(self, n_base=4, base_hidden=[64, 64, 64], grid=(0, 1),
+                 sub_hidden=[128, 128, 128], dropout=0.1, lambda1=0.0, lambda2=0.0,
+                 device=None):
+        """
+        n_base      : number of basis nodes, integer
+        base_hidden : hidden layers used in each basis node, array of integers
+        grid        : observation time grid, array of sorted floats including 0.0 and 1.0
+        sub_hidden  : hidden layers in the subsequent network, array of integers
+        dropout     : dropout probability
+        lambda1     : penalty of L1 regularization, a positive real number
+        lambda2     : penalty of L2 regularization, a positive real number
+        device      : device for the training
+        """
         super().__init__()
         self.n_base = n_base
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.device = device
-
+        # grid should include both end points
         grid = np.array(grid)
+        # send the time grid tensor to device
         self.t = torch.tensor(grid).to(device).float()
         self.h = torch.tensor(grid[1:] - grid[:-1]).to(device).float()
-
-        self.BL = nn.ModuleList(
-            [
-                FeedForward(
-                    1,
-                    hidden=base_hidden,
-                    dropout=dropout,
-                    activation=F.selu,
-                )
-                for _ in range(n_base)
-            ]
-        )
+        # instantiate each basis node in the basis layer
+        self.BL = nn.ModuleList([FeedForward(1, hidden=base_hidden, dropout=dropout, activation=F.selu)
+                                 for _ in range(n_base)])
+        # instantiate the subsequent network
         self.FF = FeedForward(n_base, sub_hidden, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, J = x.size()
         assert J == self.h.size()[0] + 1
-
         T = self.t.unsqueeze(dim=-1)
+        # evaluate the current basis nodes at time grid
         self.bases = [basis(T).transpose(-1, -2) for basis in self.BL]
-
-        l2_norms = l2_norm(torch.cat(self.bases, dim=0), self.h).detach()
-        self.normalized_bases = [
-            self.bases[i] / (l2_norms[i, 0] + 1e-6) for i in range(self.n_base)
-        ]
-
-        score = torch.cat(
-            [
-                inner_product(b.repeat((B, 1)), x, self.h)
-                for b in self.bases
-            ],
-            dim=-1,
-        )
+        """
+        compute each basis node's L2 norm
+        normalize basis nodes
+        """
+        l2_norm = _l2(torch.cat(self.bases, dim=0), self.h).detach()
+        self.normalized_bases = [self.bases[i] / (l2_norm[i, 0] + 1e-6) for i in range(self.n_base)]
+        # compute each score <basis_i, f> 
+        score = torch.cat([_inner_product(b.repeat((B, 1)), x, self.h) # (B, 1)
+                           for b in self.bases], dim=-1) # score dim = (B, n_base)
+        # take the tensor of scores into the subsequent network
         out = self.FF(score)
         return out
 
-    def orthogonality_penalty(self, n_pairs: int) -> torch.Tensor:
-        """Paper lambda1: penalize non-orthogonality between learned bases."""
-        if self.lambda1 == 0.0 or self.n_base == 1:
-            return torch.zeros(1, device=self.device)
-
-        max_pairs = self.n_base * (self.n_base - 1) // 2
-        n_pairs = min(n_pairs, max_pairs)
-        f1, f2 = [], []
-        for _ in range(n_pairs):
+    def R1(self, l2_pairs):
+        """
+        Orthogonality regularization in the paper.
+        lambda1 controls the penalty strength.
+        l2_pairs : number of pairs to regularize, integer
+        """
+        if self.lambda1 == 0 or self.n_base == 1: return torch.zeros(1).to(self.device)
+        k = min(l2_pairs, self.n_base * (self.n_base - 1) // 2)
+        f1, f2 = [None] * k, [None] * k
+        for i in range(k):
             a, b = np.random.choice(self.n_base, 2, replace=False)
-            f1.append(self.normalized_bases[a])
-            f2.append(self.normalized_bases[b])
+            f1[i], f2[i] = self.normalized_bases[a], self.normalized_bases[b]
+        return self.lambda1 * torch.mean(torch.abs(_inner_product(torch.cat(f1, dim=0),
+                                                                  torch.cat(f2, dim=0),
+                                                                  self.h)))
 
-        return self.lambda1 * torch.mean(
-            torch.abs(inner_product(torch.cat(f1, dim=0), torch.cat(f2, dim=0), self.h))
-        )
-
-    def sparsity_penalty(self, n_bases: int) -> torch.Tensor:
-        """Paper lambda2: L1 sparsity penalty on learned bases."""
-        if self.lambda2 == 0.0:
-            return torch.zeros(1, device=self.device)
-
-        selected = np.random.choice(self.n_base, min(n_bases, self.n_base), replace=False)
-        selected_bases = torch.cat(
-            [self.normalized_bases[i] for i in selected],
-            dim=0,
-        )
-        return self.lambda2 * torch.mean(l1_norm(selected_bases, self.h))
+    def R2(self, l1_k):
+        """
+        L1 sparsity regularization in the paper.
+        lambda2 controls the penalty strength.
+        l1_k : number of basis nodes to regularize, integer
+        """
+        if self.lambda2 == 0: return torch.zeros(1).to(self.device)
+        selected = np.random.choice(self.n_base, min(l1_k, self.n_base), replace=False)
+        selected_bases = torch.cat([self.normalized_bases[i] for i in selected], dim=0) # (k, J)
+        return self.lambda2 * torch.mean(_l1(selected_bases, self.h))
 
 
 z1 = [20, 5, 5] + [1] * 47
@@ -176,51 +182,60 @@ def default_response_error_sd(case: int) -> float:
     return 0.0
 
 
-def phi(k: int):
-    if k == 1:
-        return lambda t: np.ones((len(t),))
-    return lambda t: np.sqrt(2) * np.cos((k - 1) * np.pi * t)
+def _phi(k):
+    if k == 1: return lambda t: np.ones((len(t),))
+    return lambda t : np.sqrt(2) * np.cos((k-1) * np.pi * t)
 
-
-def _b1(t: np.ndarray) -> np.ndarray:
+def _b1(t):
     return (4 - 16 * t) * (0 <= t) * (t <= 1/4)
 
 
-def _b2(t: np.ndarray) -> np.ndarray:
+def _b2(t):
     return (4 - 16 * np.abs(1/2 - t)) * (1/4 <= t) * (t <= 3/4)
 
 
 class DataGenerator:
-    def __init__(self, grid: np.ndarray, case: int = 1, me: float = 0.0, err: float = 0.0):
-        if case < 1 or case > 4:
-            raise ValueError(f"Simulation case must be 1, 2, 3, or 4; got {case}.")
 
+    def __init__(self, grid, case=1, me=1, err=1):
+        """
+        grid : array of time points, floats
+        case : case number, integer
+        me   : variance of measurement error added to X, non-negative real value
+        err  : variance of noise added to Y, non-negative real value
+        """
         self.t = np.array(grid)
+        # measurement error
         self.me = me
         self.err = err
+        # case - 1
         self.case = case
-        self.z = np.array(Z[case - 1])
+        self.z = np.array(Z[case-1])
 
-    def generate(self, n: int = 1000) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def generate(self, n=1000):
+        """
+        n : number of subjects to generate, integer
+        """
+        # X = sum c_k phi_k
+        # c_k = z_k r_k, r_k iid unif[-sqrt(3), sqrt(3)]
+        # generate r
         r = np.random.uniform(low=-np.sqrt(3), high=np.sqrt(3), size=(n, 50))
-        c = r * self.z
-        basis = np.array([phi(k)(self.t) for k in range(1, 51)])
-        x = np.matmul(c, basis)
-        y = np.zeros((n, 1))
-
+        c = r * self.z # (n, 50) elementwise multiplication
+        phi = np.array([_phi(k)(self.t) for k in range(1, 51)]) # (50, len(self.t))
+        X = np.matmul(c, phi) # (n, len(self.t))
+        Y = np.zeros((n, 1))
         if self.case == 1:
-            y = (c[:, 2]) ** 2
+            Y = (c[:, 2]) ** 2
         elif self.case == 4:
             beta1 = _b1(self.t)
             beta2 = _b2(self.t)
             h = np.array(self.t[1:] - self.t[:-1]).T
             for i in range(n):
-                y[i, 0] = self._inner_product(beta2, x[i, :], h) + self._inner_product(beta1, x[i, :], h) ** 2
-        else:
-            y = (c[:, 4]) ** 2
+                Y[i, 0] = self._inner_product(beta2, X[i, :], h) + self._inner_product(beta1, X[i, :], h) ** 2
 
-        self.X = x + np.random.normal(0, self.me, size=(n, len(self.t)))
-        self.Y = y.reshape((n, 1)) + np.random.normal(0, self.err, size=(n, 1))
+        else: # self.case = 2 or 3
+            Y = (c[:, 4]) ** 2        
+        self.X = X + np.random.normal(0, self.me, size=(n, len(self.t)))
+        self.Y = Y.reshape((n, 1)) + np.random.normal(0, self.err, size=(n, 1))
         return self.X, self.Y, self.t
 
     def _inner_product(self, f1, f2, h):
@@ -231,76 +246,70 @@ class DataGenerator:
         return res
 
 
-class SplitData:
-    def __init__(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        t: np.ndarray,
-        batch_size: int = 128,
-        split: tuple[int, int, int] = (64, 16, 20),
-        seed: int = 10294,
-    ):
-        self.t = t
-        self.batch_size = batch_size
+class DataLoader:
 
-        n = x.shape[0]
-        train_n = n // sum(split) * split[0]
-        valid_n = n // sum(split) * split[1]
-        test_n = n - train_n - valid_n
+    def __init__(self, batch_size, X, Y, T, split=(8, 1, 1), random_seed=10294):
+        """
+        batch_size : batch size, integer
+        X - (n, J) : pandas.DataFrame for observed functional data, n - subject number, J - number of time points
+        Y - (n, 1) : pandas.DataFrame for response
+        split      : train/valid/test split
+        random_seed: random seed for training data re-shuffle
+        """        
+        self.n, J = X.shape
+        self.t = T.iloc[0, :].to_numpy()
+        X, Y = X.values, Y.values
+
+        # train/valid/test split
+        self.batch_size = batch_size
+        train_n = self.n // sum(split) * split[0]
+        valid_n = self.n // sum(split) * split[1]
+        test_n = self.n - train_n - valid_n
         self.train_B = train_n // batch_size
         self.valid_B = valid_n // batch_size
         self.test_B = test_n // batch_size
 
-        np.random.seed(seed)
-        order = list(range(n))
-        np.random.shuffle(order)
-        x = x[order, :]
-        y = y[order, :]
+        # random shuffle
+        np.random.seed(random_seed)
+        _order = list(range(self.n))
+        np.random.shuffle(_order)
+        X = X[_order, :]
+        Y = Y[_order, :]
 
-        self.x_standardizer = StandardScaler()
-        self.y_standardizer = StandardScaler()
+        # standardize dataset based on the training dataset
+        self.X_standardizer = StandardScaler()
+        self.Y_standardizer = StandardScaler()
 
-        self.train_x = x[: (self.train_B * self.batch_size), :]
-        self.train_y = y[: (self.train_B * self.batch_size), :]
-        self.x_standardizer.fit(self.train_x)
-        self.y_standardizer.fit(self.train_y)
-        self.train_x = self.x_standardizer.transform(self.train_x)
-        self.train_y = self.y_standardizer.transform(self.train_y)
+        # train/valid/test split
+        self.train_X = X[:(self.train_B * self.batch_size), :]
+        self.train_Y = Y[:(self.train_B * self.batch_size), :]
+        self.X_standardizer.fit(self.train_X)
+        self.Y_standardizer.fit(self.train_Y)
+        self.train_X = self.X_standardizer.transform(self.train_X)
+        self.train_Y = self.Y_standardizer.transform(self.train_Y)
 
-        self.valid_x = x[
-            (self.train_B * self.batch_size) : (
-                (self.train_B + self.valid_B) * self.batch_size
-            ),
-            :,
-        ]
-        self.valid_y = y[
-            (self.train_B * self.batch_size) : (
-                (self.train_B + self.valid_B) * self.batch_size
-            ),
-            :,
-        ]
-        self.valid_x = self.x_standardizer.transform(self.valid_x)
-        self.valid_y = self.y_standardizer.transform(self.valid_y)
+        self.valid_X = X[(self.train_B * self.batch_size):((self.train_B + self.valid_B) * self.batch_size), :]
+        self.valid_Y = Y[(self.train_B * self.batch_size):((self.train_B + self.valid_B) * self.batch_size), :]
+        self.valid_X = self.X_standardizer.transform(self.valid_X)
+        self.valid_Y = self.Y_standardizer.transform(self.valid_Y)
 
-        self.test_x = x[((self.train_B + self.valid_B) * self.batch_size) :, :]
-        self.test_y = y[((self.train_B + self.valid_B) * self.batch_size) :, :]
-        self.test_x = self.x_standardizer.transform(self.test_x)
-        self.test_y = self.y_standardizer.transform(self.test_y)
+        self.test_X = X[((self.train_B + self.valid_B) * self.batch_size):, :]
+        self.test_Y = Y[((self.train_B + self.valid_B) * self.batch_size):, :]
+        self.test_X = self.X_standardizer.transform(self.test_X)
+        self.test_Y = self.Y_standardizer.transform(self.test_Y)
 
     def shuffle(self):
-        train_size = self.train_x.shape[0]
+        # re-shuffle the training dataset
+        train_size = self.train_X.shape[0]
         new_order = list(range(train_size))
         np.random.shuffle(new_order)
-        self.train_x = self.train_x[new_order, :]
-        self.train_y = self.train_y[new_order, :]
-
-    def shuffle_train(self) -> None:
-        self.shuffle()
+        self.train_X = self.train_X[new_order, :]
+        self.train_Y = self.train_Y[new_order, :]
 
     def _batch_generator(self, X, Y, N):
+
         def generator_func():
-            for i in range(1, N + 1):
+            for i in range(1, N):
                 x = X[((i - 1) * self.batch_size):((i) * self.batch_size), :]
                 y = Y[((i - 1) * self.batch_size):((i) * self.batch_size), :]
 
@@ -309,24 +318,13 @@ class SplitData:
         return generator_func()
 
     def get_train_batch(self):
-        return self._batch_generator(self.train_x, self.train_y, self.train_B)
+        return self._batch_generator(self.train_X, self.train_Y, self.train_B)
 
     def get_valid_batch(self):
-        return self._batch_generator(self.valid_x, self.valid_y, self.valid_B)
+        return self._batch_generator(self.valid_X, self.valid_Y, self.valid_B)
 
     def get_test_batch(self):
-        return self._batch_generator(self.test_x, self.test_y, self.test_B)
-
-    def batches(self, name: str, shuffle: bool = False):
-        if name == "train":
-            if shuffle:
-                self.shuffle()
-            return self.get_train_batch()
-        elif name == "valid":
-            return self.get_valid_batch()
-        elif name == "test":
-            return self.get_test_batch()
-        raise ValueError(f"Unknown split: {name}")
+        return self._batch_generator(self.test_X, self.test_Y, self.test_B)
 
 
 def set_seed(seed: int) -> None:
@@ -391,7 +389,7 @@ def load_feedforward_checkpoint(path: Path, device: torch.device) -> FeedForward
 
 def mse_on_split(
     model: nn.Module,
-    data: SplitData,
+    data: DataLoader,
     split_name: str,
     device: torch.device,
 ) -> tuple[float, np.ndarray, np.ndarray]:
@@ -399,10 +397,18 @@ def mse_on_split(
     losses = []
     pred_all = []
     true_all = []
+    if split_name == "train":
+        batch_iter = data.get_train_batch()
+    elif split_name == "valid":
+        batch_iter = data.get_valid_batch()
+    elif split_name == "test":
+        batch_iter = data.get_test_batch()
+    else:
+        raise ValueError(f"Unknown split: {split_name}")
 
     model.eval()
     with torch.no_grad():
-        for x, y in data.batches(split_name):
+        for x, y in batch_iter:
             x = x.to(device)
             y = y.to(device)
             pred = model(x)

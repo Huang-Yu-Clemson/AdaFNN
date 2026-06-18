@@ -10,13 +10,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import Adam
 
 from simulation_common import (
     AdaFNN,
     DataGenerator,
-    SplitData,
+    DataLoader,
     load_adafnn_model,
     parse_int_list,
     resolve_device,
@@ -76,18 +77,20 @@ def train_one(args: argparse.Namespace) -> dict:
     generator = DataGenerator(grid, case=args.case, me=measurement_error, err=response_error)
     x, y, t = generator.generate(args.n_samples)
 
-    data = SplitData(
-        x,
-        y,
-        t,
-        batch_size=args.batch_size,
+    data = DataLoader(
+        args.batch_size,
+        pd.DataFrame(x),
+        pd.DataFrame(y),
+        pd.DataFrame(np.asarray(t).reshape(1, -1)),
         split=tuple(args.split),
-        seed=args.split_seed,
+        random_seed=args.split_seed,
     )
 
     base_hidden = parse_int_list(args.base_hidden)
     sub_hidden = parse_int_list(args.sub_hidden)
     n_base = args.n_base if args.n_base > 0 else default_n_base(args.case)
+    orth_pairs = n_base * (n_base - 1) // 2
+    sparse_bases = n_base
     model = AdaFNN(
         n_base=n_base,
         base_hidden=base_hidden,
@@ -126,8 +129,8 @@ def train_one(args: argparse.Namespace) -> dict:
                 loss_pred = compute_loss(out, y)
                 loss = (
                     loss_pred
-                    + model.orthogonality_penalty(args.orth_pairs)
-                    + model.sparsity_penalty(args.sparse_bases)
+                    + model.R1(orth_pairs)
+                    + model.R2(sparse_bases)
                 )
                 total_loss_train.append(loss.item())
                 pred_loss_train.append(loss_pred.item())
@@ -196,8 +199,8 @@ def train_one(args: argparse.Namespace) -> dict:
         "base_hidden": ",".join(map(str, base_hidden)),
         "sub_hidden": ",".join(map(str, sub_hidden)),
         "dropout": args.dropout,
-        "orth_pairs": args.orth_pairs,
-        "sparse_bases": args.sparse_bases,
+        "orth_pairs": orth_pairs,
+        "sparse_bases": sparse_bases,
         "split_seed": args.split_seed,
         "device": str(device),
     }
@@ -235,11 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-base", type=int, default=0)
     parser.add_argument("--base-hidden", default="128,128,128")
     parser.add_argument("--sub-hidden", default="128,128,128")
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lambda1", type=float, required=True)
     parser.add_argument("--lambda2", type=float, required=True)
-    parser.add_argument("--orth-pairs", type=int, default=3)
-    parser.add_argument("--sparse-bases", type=int, default=2)
 
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=128)

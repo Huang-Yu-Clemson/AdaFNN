@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sim_base_mc
 #SBATCH --time=04:00:00
-#SBATCH --array=0-499%50
+#SBATCH --array=0-499%100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -128,7 +128,7 @@ python run_sim_baselines_mc.py \
   --err "${response_error}" \
   --split 64 16 20 \
   --hidden 128,128,128 \
-  --dropout 0.0 \
+  --dropout 0.1 \
   --epochs 500 \
   --batch-size 128 \
   --lr 0.0003
